@@ -9,10 +9,21 @@ exported/
 exported_all/
 decoded_images/
 
+# 测试/调研产生的临时数据
+*.db
+*.db-wal
+*.db-shm
+_synth_run/
+_probe_*
+ref_*/
+*.zip
+
 # Python
 .venv/
 .runtime/
 *.pyc
 __pycache__/
+.pytest_cache/
+.mypy_cache/
 
 .DS_Store

@@ -1,83 +1,231 @@
 #!/usr/bin/env python3
-"""密钥映射 — 把 hunt 抓到的候选密钥逐一验证并映射到数据库，
-生成 decrypt 使用的 all_keys.json。
+"""密钥映射 — 校验候选密钥并生成 decrypt 使用的 all_keys.json。
 
-验证方式与解密器一致：用候选 enc_key 派生 mac key（PBKDF2-SHA512,
-salt^0x3a, 2 轮），对数据库第 1 页做 HMAC-SHA512 校验。
-候选来源：hunted_keys.txt（CCCryptorCreate 抓到的 raw key）
-       + hunt.log 的 PBKDF pw= 字段（同为 raw enc_key）。
+候选来源：hunted_keys.txt（Config.Cipher / legacy / 手动）、hunt.log 的
+PBKDF 字段、已有 all_keys.json、--key-file 与 --passphrase。所有候选都必须
+通过数据库第 1 页的 HMAC-SHA512 校验，未验证的 key 不会写入。
 """
-import hashlib
-import hmac
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import re
-import struct
+import sys
+from pathlib import Path
 
 from wxexport.config import PROJECT_ROOT, load_config
+from wxexport.keys.utils import secure_file, strip_key_metadata
+from wxexport.sqlcipher import PAGE_SZ, SALT_SZ, derive_enc_key, page1_hmac_ok
 
-PAGE_SZ, KEY_SZ, SALT_SZ, IV_SZ, HMAC_SZ, RESERVE_SZ = 4096, 32, 16, 16, 64, 80
+PBKDF_RE = re.compile(r"PBKDF pw=([0-9a-fA-F]{64})\b")
 
 
-def page1_hmac_ok(enc_key, page1):
-    salt = page1[:SALT_SZ]
-    mac_key = hashlib.pbkdf2_hmac(
-        "sha512", enc_key, bytes(b ^ 0x3A for b in salt), 2, dklen=KEY_SZ)
-    hm = hmac.new(mac_key, page1[SALT_SZ:PAGE_SZ - RESERVE_SZ + IV_SZ],
-                  hashlib.sha512)
-    hm.update(struct.pack("<I", 1))
-    return hm.digest() == page1[PAGE_SZ - HMAC_SZ:PAGE_SZ]
+def _normalize(path: str) -> str:
+    return str(path).replace("\\", "/")
+
+
+def collect_databases(db_dir: Path):
+    databases = []
+    for dirpath, _dirnames, filenames in os.walk(db_dir):
+        for name in filenames:
+            if not name.endswith(".db") or name.endswith(("-wal", "-shm")):
+                continue
+            path = Path(dirpath) / name
+            try:
+                if path.stat().st_size < PAGE_SZ:
+                    continue
+                with open(path, "rb") as stream:
+                    page1 = stream.read(PAGE_SZ)
+            except OSError:
+                continue
+            if len(page1) < PAGE_SZ:
+                continue
+            rel = _normalize(os.path.relpath(path, db_dir))
+            databases.append((rel, path, page1))
+    databases.sort(key=lambda item: item[0])
+    return databases
+
+
+def _hex_candidates(value: str):
+    """Yield (key, salt) from a 64/96/192-character hex candidate."""
+    value = value.strip().lower().lstrip("x").strip("'")
+    if len(value) < 64:
+        return
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        return
+    for offset in range(0, max(1, len(raw) - 31), 32):
+        key = raw[offset:offset + 32]
+        if len(key) != 32:
+            continue
+        salt = raw[offset + 32:offset + 48]
+        yield key, salt if len(salt) == SALT_SZ else None
+
+
+def _load_file_candidates(path: Path):
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    candidates = []
+    if isinstance(payload, dict):
+        for rel, value in payload.items():
+            if str(rel).startswith("_"):
+                continue
+            if isinstance(value, dict):
+                value = value.get("enc_key") or value.get("key")
+            if isinstance(value, str):
+                for key, salt in _hex_candidates(value):
+                    candidates.append((key, salt, f"key-file:{rel}"))
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, str):
+                for key, salt in _hex_candidates(item):
+                    candidates.append((key, salt, "key-file"))
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pieces = line.split()
+            for key, salt in _hex_candidates(pieces[-1]):
+                rel = pieces[0] if len(pieces) > 1 else ""
+                candidates.append((key, salt, f"key-file:{rel}" if rel else "key-file"))
+    return candidates
+
+
+def _load_settings_candidates(hunted_file: Path, log_file: Path,
+                              keys_file: Path):
+    candidates = []
+    if hunted_file.is_file():
+        for line in hunted_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            for key, salt in _hex_candidates(value.split()[-1]):
+                candidates.append((key, salt, "hunted_keys"))
+    if log_file.is_file():
+        try:
+            text = log_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for match in PBKDF_RE.finditer(text):
+            for key, salt in _hex_candidates(match.group(1)):
+                candidates.append((key, salt, "hunt.log"))
+    if keys_file.is_file():
+        try:
+            payload = json.loads(keys_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        for rel, value in strip_key_metadata(payload).items():
+            if isinstance(value, dict):
+                value = value.get("enc_key") or value.get("key")
+            if isinstance(value, str):
+                for key, salt in _hex_candidates(value):
+                    candidates.append((key, salt, f"existing:{rel}"))
+    return candidates
+
+
+def _verify(candidates, databases, mapping, log):
+    for key, salt, source in candidates:
+        salt_hex = salt.hex() if salt else None
+        for rel, _path, page1 in databases:
+            if rel in mapping:
+                continue
+            if salt_hex and page1[:SALT_SZ].hex() != salt_hex:
+                continue
+            if page1_hmac_ok(key, page1):
+                mapping[rel] = {
+                    "enc_key": key.hex(),
+                    "salt": page1[:SALT_SZ].hex(),
+                    "source": source,
+                }
+                if log:
+                    log(f"  [KEY] {rel} ← {source}")
 
 
 def main():
     cfg = load_config()
-    db_dir = cfg["db_dir"]
-    hunted = PROJECT_ROOT / "hunted_keys.txt"
-    hunt_log = PROJECT_ROOT / "hunt.log"
-    out_file = cfg["keys_file"]
+    parser = argparse.ArgumentParser(description="验证并映射微信数据库密钥")
+    parser.add_argument("--db-dir", default=None,
+                        help="覆盖 config 中的数据库目录（如 Windows 快照）")
+    parser.add_argument("--key-file", type=Path, default=None,
+                        help="额外候选密钥文件（JSON 或每行 hex）")
+    parser.add_argument("--passphrase", default=None,
+                        help="32 字节 passphrase（64hex），用于 PBKDF2 派生")
+    args = parser.parse_args()
 
-    if not hunted.exists():
-        print(f"[ERROR] 未找到 {hunted}，请先运行 wxexport.keys.hunt")
-        raise SystemExit(1)
+    db_dir = Path(args.db_dir or cfg.get("decrypt_db_dir") or cfg["db_dir"]).expanduser()
+    if not db_dir.is_dir():
+        print(f"[ERROR] 数据库目录不存在: {db_dir}")
+        return 1
+    hunted_file = Path(cfg.get("hunted_file") or "hunted_keys.txt").expanduser()
+    log_file = Path(cfg.get("hunt_log") or (PROJECT_ROOT / "hunt.log")).expanduser()
+    keys_file = Path(cfg["keys_file"]).expanduser()
+    databases = collect_databases(db_dir)
+    if not databases:
+        print(f"[ERROR] 在 {db_dir} 未找到可解密的 .db 文件")
+        return 1
 
-    keys = [bytes.fromhex(l.strip()) for l in hunted.read_text().splitlines() if l.strip()]
-    try:
-        for m in re.finditer(r"PBKDF pw=([0-9a-f]{64}) ", hunt_log.read_text()):
-            keys.append(bytes.fromhex(m.group(1)))
-    except FileNotFoundError:
-        pass
-    keys = list(dict.fromkeys(keys))
-    print(f"[+] {len(keys)} 个候选密钥")
+    candidates = _load_settings_candidates(hunted_file, log_file, keys_file)
+    if args.key_file:
+        candidates.extend(_load_file_candidates(args.key_file))
 
+    print(f"[+] {len(databases)} 个数据库，{len(candidates)} 个候选密钥")
     mapping = {}
-    db_files = []
-    for root, dirs, files in os.walk(db_dir):
-        for f in files:
-            if not f.endswith(".db"):
-                continue
-            path = os.path.join(root, f)
-            with open(path, "rb") as fh:
-                page1 = fh.read(PAGE_SZ)
-            if len(page1) < PAGE_SZ:
-                continue
-            for k in keys:
-                if page1_hmac_ok(k, page1):
-                    rel = os.path.relpath(path, db_dir)
-                    mapping[rel] = {"enc_key": k.hex()}
-                    break
-            db_files.append(os.path.relpath(path, db_dir))
+    _verify(candidates, databases, mapping, print)
 
-    with open(out_file, "w") as f:
-        json.dump(mapping, f, indent=4, ensure_ascii=False)
-    os.chmod(out_file, 0o600)
+    if args.passphrase:
+        try:
+            passphrase = bytes.fromhex(args.passphrase.strip())
+        except ValueError:
+            print("[ERROR] passphrase 必须是 64 位十六进制字符串")
+            return 1
+        for rel, _path, page1 in databases:
+            if rel in mapping:
+                continue
+            key = derive_enc_key(passphrase, page1[:SALT_SZ])
+            if page1_hmac_ok(key, page1):
+                mapping[rel] = {
+                    "enc_key": key.hex(),
+                    "salt": page1[:SALT_SZ].hex(),
+                    "source": "passphrase",
+                }
+                print(f"  [KEY] {rel} ← passphrase")
 
-    print(f"[+] 匹配 {len(mapping)}/{len(db_files)} 个数据库，已写入 {out_file}")
-    missing = [d for d in sorted(db_files) if d not in mapping]
+    # Preserve verified metadata from an older file, but only for databases
+    # that still validate against the current data.
+    payload = dict(mapping)
+    payload["_meta"] = {
+        "platform": cfg.get("platform"),
+        "db_dir": str(db_dir),
+        "databases": len(databases),
+        "matched": len(mapping),
+        "keys_file": str(keys_file),
+    }
+    keys_file.parent.mkdir(parents=True, exist_ok=True)
+    keys_file.write_text(
+        json.dumps(payload, indent=4, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    secure_file(keys_file)
+
+    print(f"[+] 匹配 {len(mapping)}/{len(databases)} 个数据库，已写入 {keys_file}")
+    missing = [rel for rel, _path, _page1 in databases if rel not in mapping]
     if missing:
-        print(f"[!] 未覆盖 {len(missing)} 个（缺少密钥的库可在微信中打开对应功能后重跑 wxexport.keys.hunt）:")
-        for d in missing:
-            print(f"    {d}")
+        print(f"[!] 未覆盖 {len(missing)} 个（可在微信中打开对应功能后重跑，"
+              "或使用 --key/--passphrase）:")
+        for rel in missing:
+            print(f"    {rel}")
+    return 0 if mapping else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

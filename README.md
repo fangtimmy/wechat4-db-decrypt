@@ -1,8 +1,127 @@
-# wechat4-macos-frida-export
+# wechat4-frida-export
 
-macOS 平台微信（WeChat 4.x）本地聊天记录解密与导出工具。针对微信 4.1.10 起
-的密钥存储机制变更，采用 Frida 运行时拦截方式获取各数据库的 SQLCipher 密钥，
-随后完成解密与批量导出。
+微信 4.x 本地聊天记录解密与导出（Windows / macOS）。
+
+Windows 版使用对 `Weixin.exe` 的**只读内存扫描**获取 SQLCipher 密钥，不需要
+Frida 注入、不修改微信文件；macOS 版继续使用原来的内嵌 Frida Gadget +
+CommonCrypto 拦截链路。两端的解密、WAL 合并和 TXT/CSV/JSON 导出逻辑共用。
+
+Windows 的详细说明见 [docs/WINDOWS.md](docs/WINDOWS.md)。
+
+## Windows
+
+### 环境要求
+
+- Windows 10/11 x64
+- 微信 4.x 桌面版，已登录
+- Python 3.10+，或安装 [uv](https://docs.astral.sh/uv/)（推荐）
+- 通常不需要管理员。若读取进程内存被拒绝，再以管理员身份运行终端
+
+### 快速开始
+
+```powershell
+.\run.bat
+# 或
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+首次运行会自动：
+
+1. 读取 `%APPDATA%\Tencent\xwechat\config\*.ini` 确定数据根目录，同时枚举
+   `xwechat_files\*\db_storage`；多个账号目录按最近使用时间选择，必要时提示
+   选择。`Documents` 只作为回退，旧账号副本不会覆盖当前账号
+2. 扫描 `Weixin.exe` 的 `com.Tencent.WCDB.Config.Cipher` 对象，解出每个库的
+   key，并用数据库首页 HMAC-SHA512 逐一验证
+3. 把 `db_storage`（含 `-wal`/`-shm`）复制到 `.runtime\win-snapshot`，后续
+   映射/解密默认读取快照，避免微信持续写入造成不一致
+4. 解密到 `decrypted\`，导出到 `exported_all\`
+
+输出格式与 macOS 版一致：
+
+```text
+exported_all/
+├── index.csv
+└── chats/<会话名>/
+    ├── chat.txt
+    ├── chat.csv
+    └── chat.json
+```
+
+### 常用参数
+
+```powershell
+# 指定导出目录
+.\run.ps1 -Output D:\WeChat-Export
+
+# 密钥未变化时跳过抓取
+.\run.ps1 -NoHunt -Output D:\WeChat-Export
+
+# 微信升级、切换账号或迁移数据后刷新快照并重新抓取
+.\run.ps1 -RefreshSnapshot -Output D:\WeChat-Export
+
+# 多个账号/自定义数据目录
+.\run.ps1 -DbDir "D:\微信\xwechat_files\<wxid>_xxxx\db_storage"
+
+# 自动抓取失败时，手动提供 32 字节 raw key / passphrase
+.\run.ps1 -Passphrase <64位hex>
+.\run.ps1 -KeyFile .\keys.json
+
+# 只使用已保存的密钥，不扫描微信进程
+.\run.ps1 -NoHunt
+```
+
+`-Yes` 在非交互环境中选择最近使用的数据目录；`-Deep` 额外尝试
+passphrase/PBKDF2 扫描（较慢）；`-Inject` 是实验性 Frida spawn 路径，默认
+不使用，且需要先退出微信。
+
+### 分步执行
+
+```powershell
+python -m wxexport.keys.hunt
+python -m wxexport.keys.map
+python -m wxexport.decrypt
+python -m wxexport.export.all --output .\exported_all
+```
+
+### 手动密钥格式
+
+`keys.json` 可以是：
+
+```json
+{
+  "message/message_0.db": {"enc_key": "<64位hex>"},
+  "contact/contact.db": "<64位hex>"
+}
+```
+
+也可以是每行一个 64 位 hex（或 96 位 `key+salt`）：
+
+```text
+0123456789abcdef...（64 hex）
+x'0123456789abcdef...（96 hex）'
+```
+
+所有手动 key 同样必须通过 HMAC 校验，错误 key 会被拒绝。`all_keys.json`
+包含可用密钥，等同于全部聊天解密能力，请勿提交或分享。
+
+### Windows 工作原理与限制
+
+- 微信 4.1.10+ 不再在内存中缓存 `x'<key><salt>'`；Windows 4.1.15.13 的主路径
+  是运行时 `Config.Cipher` 只读扫描（已在本机验证 20/20）。4.0.x–4.1.9 可
+  回退旧式 `x'...'` 扫描
+- 扫描参数（对象偏移、XOR mask）与版本有关，集中在
+  `src/wxexport/win/profiles.py`；微信升级后如自动扫描失效，使用
+  `--passphrase/--key-file` 手动兜底
+- 媒体文件（图片、语音、视频）本体不导出，仅输出 `[图片]` 等占位符和元数据
+- `migrate/unspportmsg.db`、`biz_message_0.db` 等库可能缺少密钥；不影响已覆盖
+  的会话
+- 数据目录、密钥、解密库和导出结果都属于敏感数据；确认不再需要后请删除
+  `all_keys.json`、`hunted_keys.txt`、`.runtime\`、`decrypted\`
+
+## macOS
+
+macOS 版针对微信 4.1.10 起的密钥存储机制变更，采用 Frida 运行时拦截
+CommonCrypto 获取各数据库的 SQLCipher 密钥，随后解密与批量导出。
 
 ## 适用范围
 
@@ -156,28 +275,39 @@ exported_all/
 ## 文件说明
 
 ```
-├── run.sh                     # 全流程入口
+├── run.sh                     # macOS 全流程入口
+├── run.ps1 / run.bat          # Windows 全流程入口
+├── docs/WINDOWS.md            # Windows 架构、版本策略与排查
 ├── pyproject.toml / uv.lock   # 依赖与 Python 版本（uv 托管）
 └── src/wxexport/
-    ├── config.py              # 配置加载、项目根路径、微信数据目录自动检测
-    ├── check_permissions.py   # 导出前检查 TCC/完全磁盘访问权限
+    ├── config.py              # 配置加载、项目根路径、macOS/Windows 数据目录检测
+    ├── check_permissions.py   # 导出前检查 TCC（macOS）或数据/进程权限（Windows）
+    ├── sqlcipher.py           # 共享 SQLCipher 4 原语（HMAC、PBKDF2、逐页解密）
     ├── msgparse.py            # 消息类型解码与内容渲染（64 位 local_type、appmsg 各子类型）
     ├── decrypt.py             # SQLCipher 4 逐页解密器；合并 -wal 未落盘帧，--db-dir 指定快照源
     ├── sip/
-    │   ├── prepare.py         # SIP 模式构建器：下载 Gadget、复制官方 App、注入、重签名
+    │   ├── prepare.py         # macOS SIP 模式构建器：下载 Gadget、复制官方 App、注入、重签名
     │   ├── macho_inject.py    # 无依赖的 Mach-O LC_LOAD_DYLIB 注入器
     │   └── config.py          # 调试副本路径与身份常量
+    ├── win/
+    │   ├── config.py          # Windows 安装/版本/数据根目录（ini）检测
+    │   ├── memory.py          # ctypes 只读进程内存访问、主进程识别
+    │   ├── keyscan.py         # Config.Cipher/legacy/passphrase/手动 key 抓取与 HMAC 验证
+    │   ├── profiles.py        # 版本相关偏移与 XOR mask
+    │   ├── snapshot.py        # Windows 数据快照（含 -wal/-shm）
+    │   ├── inject.py          # 实验性 Frida spawn hook（显式 --inject）
+    │   └── hook.js            # 实验性 Windows Hook 脚本
     ├── keys/
-    │   ├── hunt.py            # 无 root 的 Gadget 控制器；APFS 数据快照、loopback 连接、静默超时
-    │   ├── hook.js            # Gadget 脚本，拦截 CommonCrypto 各入口上报候选密钥
+    │   ├── hunt.py            # macOS Gadget 控制器 / Windows 只读扫描入口
+    │   ├── hook.js            # macOS Gadget 脚本，拦截 CommonCrypto 各入口
     │   ├── map.py             # 候选密钥逐库 HMAC-SHA512 验证，生成 all_keys.json
-    │   └── utils.py           # all_keys.json 读写辅助
+    │   └── utils.py           # all_keys.json 路径/权限辅助
     └── export/
         ├── all.py             # 全部会话批量导出（TXT/CSV/JSON + index.csv）
         └── chats.py           # 指定会话导出与会话列表（--username/--name/--list）
 ```
 
-测试：`uv run python -m unittest discover -s tests`（消息渲染回归用例）。
+测试：`python -m unittest discover -s tests`（macOS 可用 `uv run python -m unittest discover -s tests`）。
 
 ## 已知限制
 
@@ -223,6 +353,11 @@ exported_all/
 - [Thearas/wechat-db-decrypt-macos](https://github.com/Thearas/wechat-db-decrypt-macos)、
   [TANGandXUE/wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) —
   4.1+ 密钥机制变化的分析
+- [TANGandXUE/wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) —
+  Windows `Config.Cipher` 运行时只读扫描算法与偏移（MIT）；Windows 端在其公开
+  实现基础上重新组织为多策略扫描器，并继续使用 HMAC 校验作为唯一接受标准
+- [NinjaSln-labs/wxlocal](https://github.com/NinjaSln-labs/wxlocal) —
+  WeChat 4.1.x Windows 版本演进、数据目录与密钥驻留形态的研究记录
 
 ## 免责声明
 

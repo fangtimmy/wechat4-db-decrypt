@@ -19,30 +19,61 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 from wxexport.config import PROJECT_ROOT, load_config
 from wxexport.msgparse import SYSTEM_TYPES, parse_message
 
-_cfg = load_config()
-DECRYPTED_DIR = _cfg["decrypted_dir"]
-CONTACT_DB = os.path.join(DECRYPTED_DIR, "contact", "contact.db")
 DEFAULT_OUT_ROOT = os.path.join(PROJECT_ROOT, "exported_all")
 CST = timezone(timedelta(hours=8))
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def get_decrypted_dir():
+    return load_config()["decrypted_dir"]
+
+
+def get_contact_db():
+    return os.path.join(get_decrypted_dir(), "contact", "contact.db")
+
+
+def _connect(path):
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.Error:
+        pass
+    return conn
+
+
+def _md5(value):
+    try:
+        return hashlib.md5(value, usedforsecurity=False).hexdigest()
+    except TypeError:  # pragma: no cover - Python < 3.9
+        return hashlib.md5(value).hexdigest()
 
 
 def get_message_dbs():
-    msg_dir = os.path.join(DECRYPTED_DIR, "message")
+    msg_dir = os.path.join(get_decrypted_dir(), "message")
     dbs = []
-    for f in sorted(os.listdir(msg_dir)):
+    try:
+        names = sorted(os.listdir(msg_dir))
+    except OSError:
+        return []
+    for f in names:
         if re.fullmatch(r"message_\d+\.db", f):
             dbs.append(os.path.join(msg_dir, f))
     return dbs
 
 
 def load_contact_map():
-    conn = sqlite3.connect(CONTACT_DB)
+    conn = _connect(get_contact_db())
     m = {}
     for username, nick, remark in conn.execute(
             "SELECT username, nick_name, remark FROM contact"):
@@ -55,7 +86,7 @@ def detect_my_wxid():
     """账号主人 = 在最多不同会话中作为发送者出现的 wxid。"""
     table_senders = []
     for db_path in get_message_dbs():
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             tables = [r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")]
@@ -86,12 +117,16 @@ def detect_my_wxid():
 
 
 def sanitize(name, fallback):
-    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name).strip(" .")[:80]
-    return name or fallback
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name).strip(" .")[:80].rstrip(" .")
+    if not name:
+        return fallback
+    if os.name == "nt" and name.split(".")[0].upper() in _WINDOWS_RESERVED:
+        name = "_" + name
+    return name
 
 
 def export_one(username, display, contact_map, my_wxid, seen_dirs, chats_dir=None):
-    table = "Msg_" + hashlib.md5(username.encode()).hexdigest()
+    table = "Msg_" + _md5(username.encode())
     out_name = sanitize(display, username)
     if out_name in seen_dirs:
         out_name = sanitize(f"{out_name}_{username}", username)
@@ -103,7 +138,7 @@ def export_one(username, display, contact_map, my_wxid, seen_dirs, chats_dir=Non
 
     messages = []
     for db_path in get_message_dbs():
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             name2id = {}
             try:
@@ -181,6 +216,33 @@ def export_one(username, display, contact_map, my_wxid, seen_dirs, chats_dir=Non
             "开始": messages[0]["time"], "结束": messages[-1]["time"]}
 
 
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(str(pathlib.Path(path).resolve(strict=False))))
+
+
+def _move(source, destination):
+    last_error = None
+    for attempt in range(20):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.1 * (attempt + 1))
+    raise last_error
+
+
+def _rmtree(path):
+    for attempt in range(8):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.1 * (attempt + 1))
+
+
 def main():
     parser = argparse.ArgumentParser(description="批量导出全部微信会话")
     parser.add_argument(
@@ -189,15 +251,14 @@ def main():
     args = parser.parse_args()
 
     # 聊天记录包含敏感数据；新建目录/文件仅允许当前用户访问。
-    os.umask(0o077)
+    if hasattr(os, "umask"):
+        os.umask(0o077)
     final_root = pathlib.Path(args.output).expanduser().absolute()
-    protected = {
-        pathlib.Path("/").resolve(),
-        pathlib.Path.home().resolve(),
-        (pathlib.Path.home() / "Desktop").resolve(),
-        pathlib.Path(PROJECT_ROOT).resolve(),
-    }
-    if final_root.resolve(strict=False) in protected:
+    protected = {_path_key(path) for path in (
+        pathlib.Path("/"), pathlib.Path.home(),
+        pathlib.Path.home() / "Desktop", pathlib.Path(PROJECT_ROOT),
+    )}
+    if _path_key(final_root) in protected:
         parser.error(f"拒绝使用受保护目录作为导出目标: {final_root}")
     if final_root.is_symlink():
         parser.error(f"导出目标不能是符号链接: {final_root}")
@@ -219,18 +280,18 @@ def main():
                 f".{final_root.name}.previous-{os.getpid()}")
             if previous.exists():
                 raise RuntimeError(f"临时备份路径已存在: {previous}")
-            final_root.rename(previous)
+            _move(final_root, previous)
         try:
-            staging.rename(final_root)
+            _move(staging, final_root)
         except Exception:
             if previous is not None:
-                previous.rename(final_root)
+                _move(previous, final_root)
             raise
         if previous is not None:
-            shutil.rmtree(previous, ignore_errors=True)
+            _rmtree(previous)
     finally:
         if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+            _rmtree(staging)
 
     print(f"[+] 输出目录: {final_root}")
 
@@ -249,11 +310,11 @@ def export_all(out_root, chats_dir):
 
     md5_to_username = {}
     for username in contact_map:
-        md5_to_username[hashlib.md5(username.encode()).hexdigest()] = username
+        md5_to_username[_md5(username.encode())] = username
 
     conv_tables = set()
     for db_path in get_message_dbs():
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         for (t,) in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"):
             conv_tables.add(t)

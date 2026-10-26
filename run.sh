@@ -1,10 +1,20 @@
 #!/bin/bash
-# 一键导出：构建 SIP 调试副本 → Gadget 抓密钥 → 映射 → 解密 → 批量导出
+# 一键导出（macOS）：构建 SIP 调试副本 → Gadget 抓密钥 → 映射 → 解密 → 批量导出
+# Windows 请使用 run.ps1 / run.bat。
 # 用法:
 #   ./run.sh              # 全流程
 #   ./run.sh --no-hunt    # 跳过抓密钥（密钥没变时，只重新解密+导出）
 #   ./run.sh --no-restart # 连接已运行的 Gadget 微信副本
 set -euo pipefail
+
+case "$(uname -s)" in
+    Darwin) ;;
+    *)
+        echo "[!] run.sh 仅适用于 macOS；Windows 请使用 run.ps1 或 run.bat" >&2
+        exit 1
+        ;;
+esac
+
 cd "$(dirname "$0")"
 
 NO_HUNT=0

@@ -7,16 +7,16 @@
     uv run python -m wxexport.export.chats --name "昵称或备注" --out ./out
 """
 import argparse
-import hashlib
 import os
 import sqlite3
 
-from wxexport.export.all import (DECRYPTED_DIR, detect_my_wxid, export_one,
-                                 get_message_dbs, load_contact_map)
+from wxexport.export.all import (_connect, _md5, detect_my_wxid, export_one,
+                                 get_decrypted_dir, get_message_dbs,
+                                 load_contact_map)
 
 
 def find_contacts(query):
-    conn = sqlite3.connect(os.path.join(DECRYPTED_DIR, "contact", "contact.db"))
+    conn = _connect(os.path.join(get_decrypted_dir(), "contact", "contact.db"))
     rows = conn.execute("""
         SELECT username, nick_name, remark, alias FROM contact
         WHERE username = ? OR nick_name LIKE ? OR remark LIKE ? OR alias LIKE ?
@@ -29,11 +29,11 @@ def list_conversations(top_n=20):
     """列出所有会话（按消息数排序），并映射出联系人显示名。"""
     contact_map = load_contact_map()
     table_to_username = {
-        "Msg_" + hashlib.md5(u.encode()).hexdigest(): u for u in contact_map}
+        "Msg_" + _md5(u.encode()): u for u in contact_map}
 
     conversations = {}
     for db_path in get_message_dbs():
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             tables = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
@@ -110,10 +110,10 @@ def main():
     my_wxid, _ = detect_my_wxid()
 
     # 目标会话的消息表所在的库
-    tables = {"Msg_" + hashlib.md5(u.encode()).hexdigest() for u in usernames}
+    tables = {"Msg_" + _md5(u.encode()) for u in usernames}
     found = set()
     for db_path in get_message_dbs():
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         found |= {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
         } & tables
@@ -121,7 +121,7 @@ def main():
 
     seen_dirs = set()
     for username in usernames:
-        table = "Msg_" + hashlib.md5(username.encode()).hexdigest()
+        table = "Msg_" + _md5(username.encode())
         if table not in found:
             print(f"[!] {username}: 本地消息库中无此会话"
                   + ("（数据可能只在手机上，需先迁移到电脑微信）" if table in tables else ""))
