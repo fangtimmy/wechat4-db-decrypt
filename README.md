@@ -1,4 +1,4 @@
-# wechat4-frida-export
+# wechat4-db-decrypt
 
 微信 4.x 本地聊天记录解密与导出（Windows / macOS）。
 
